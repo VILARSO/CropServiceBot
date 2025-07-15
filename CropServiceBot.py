@@ -51,6 +51,20 @@ def init_mongo_db():
         logging.critical(f"An unexpected error occurred during MongoDB connection: {e}", exc_info=True)
         exit(1)
 
+async def remove_old_posts_periodically(interval_sec: int = 3600):
+    """
+    Видаляє оголошення, старші за 7 днів, кожні interval_sec секунд.
+    """
+    while True:
+        try:
+            threshold = datetime.utcnow() - timedelta(days=7)
+            result = db.posts.delete_many({'created_at': {'$lt': threshold}})
+            if result.deleted_count > 0:
+                logging.info(f"Автоматично видалено {result.deleted_count} оголошень старших за 7 днів.")
+        except Exception as e:
+            logging.error(f"Помилка при автоматичному видаленні старих оголошень: {e}", exc_info=True)
+        await asyncio.sleep(interval_sec)  # Чекаємо перед наступною перевіркою
+
 # Функція для отримання послідовних ID з MongoDB
 def get_next_sequence_value(sequence_name):
     """
@@ -835,7 +849,9 @@ async def err_handler(update, exception):
     logging.critical(f"Unhandled error: {exception}", exc_info=True)
     return True
 
-if __name__ == '__main__':
+if name == 'main':
     logging.info("Starting bot...")
     init_mongo_db() # Ініціалізуємо підключення до MongoDB перед запуском бота
+    loop = asyncio.get_event_loop()
+    loop.create_task(remove_old_posts_periodically(3600))  # Запускаємо фонову задачу видалення, раз на годину
     executor.start_polling(dp, skip_updates=True)
