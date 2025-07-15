@@ -853,5 +853,5 @@ if __name__ == '__main__':
     logging.info("Starting bot...")
     init_mongo_db() # Ініціалізуємо підключення до MongoDB перед запуском бота
     loop = asyncio.get_event_loop()
-    loop.create_task(remove_old_posts_periodically(3600))  # Запускаємо фонову задачу видалення, раз на годину
+    loop.create_task(remove_old_posts_periodically(10))  # Запускаємо фонову задачу видалення, раз на годину
     executor.start_polling(dp, skip_updates=True)
