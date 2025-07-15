@@ -849,7 +849,7 @@ async def err_handler(update, exception):
     logging.critical(f"Unhandled error: {exception}", exc_info=True)
     return True
 
-if name == 'main':
+if __name__ == '__main__':
     logging.info("Starting bot...")
     init_mongo_db() # Ініціалізуємо підключення до MongoDB перед запуском бота
     loop = asyncio.get_event_loop()
