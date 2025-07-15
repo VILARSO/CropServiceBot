@@ -1,9 +1,10 @@
 import re
-import json
 import os
 import asyncio
 import logging
 from datetime import datetime, timedelta
+from pymongo import MongoClient # Імпортуємо модуль для роботи з MongoDB
+from pymongo.errors import ConnectionFailure, OperationFailure
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
@@ -19,15 +20,46 @@ if not API_TOKEN:
     print("❌ API_TOKEN не заданий. Будь ласка, встановіть змінну середовища API_TOKEN.")
     exit(1)
 
+# Налаштування MongoDB URI
+# Railway часто надає MONGO_URL або DATABASE_URL для MongoDB
+MONGO_URI = os.getenv('MONGO_URL') or os.getenv('DATABASE_URL')
+if not MONGO_URI:
+    print("❌ MONGO_URL або DATABASE_URL не заданий. Будь ласка, встановіть змінну середовища для підключення до MongoDB.")
+    exit(1)
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logging.getLogger().addHandler(logging.StreamHandler())
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot, storage=MemoryStorage())
 
-# ======== Файли ========
-JSON_FILE = 'posts.json'
-ANALYTICS_FILE = 'analytics.log'
+# ======== Файли (видаляємо JSON, додаємо DB) ========
+ANALYTICS_FILE = 'analytics.log' # Залишаємо для логів аналітики
+
+# ======== Підключення до MongoDB ========
+mongo_client = None
+db = None
+posts_collection = None
+
+def init_mongo_db():
+    """Ініціалізує з'єднання з MongoDB та отримує колекцію posts."""
+    global mongo_client, db, posts_collection
+    try:
+        mongo_client = MongoClient(MONGO_URI)
+        db = mongo_client.get_default_database() # Отримуємо базу даних з URI
+        posts_collection = db.posts # Отримуємо колекцію "posts"
+        # Перевірка з'єднання
+        mongo_client.admin.command('ping') 
+        logging.info("Successfully connected to MongoDB!")
+    except ConnectionFailure as e:
+        logging.error(f"Could not connect to MongoDB: {e}")
+        exit(1)
+    except Exception as e:
+        logging.error(f"An unexpected error occurred during MongoDB initialization: {e}")
+        exit(1)
+
+# Викликаємо ініціалізацію БД при запуску бота
+init_mongo_db()
 
 # ======== Категорії ========
 CATEGORIES = [
@@ -69,42 +101,7 @@ class AppStates(StatesGroup):
     EDIT_DESC = State()
 
 
-# ======== Утиліти для роботи з даними ========
-def load_json(path, default=None):
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        logging.warning(f"File not found: {path}. Returning default.")
-        return default if default is not None else []
-    except json.JSONDecodeError:
-        logging.error(f"Error decoding JSON from {path}. File might be corrupted. Returning default.")
-        try:
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(default if default is not None else [], f, ensure_ascii=False, indent=2)
-            logging.info(f"Attempted to reset corrupted file: {path}")
-        except Exception as e:
-            logging.error(f"Failed to reset corrupted file {path}: {e}")
-        return default if default is not None else []
-    except Exception as e:
-        logging.error(f"Unexpected error loading JSON from {path}: {e}")
-        return default if default is not None else []
-
-def save_json(path, data):
-    try:
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logging.error(f"Error saving JSON to {path}: {e}")
-
-# Додані функції load_posts та save_posts
-def load_posts():
-    """Завантажує оголошення з JSON_FILE."""
-    return load_json(JSON_FILE, default=[])
-
-def save_posts(posts):
-    """Зберігає оголошення у JSON_FILE."""
-    save_json(JSON_FILE, posts)
+# ======== Утиліти для роботи з даними (MongoDB) ========
 
 def log_event(text):
     """Логує події у файл аналітики."""
@@ -114,8 +111,80 @@ def log_event(text):
     except Exception as e:
         logging.error(f"Error logging event to {ANALYTICS_FILE}: {e}")
 
-def gen_id(posts):
-    return max([p['id'] for p in posts], default=0) + 1
+# Функції для роботи з постами в MongoDB
+def add_post_to_db(post_data):
+    """Додає нове оголошення до бази даних MongoDB."""
+    try:
+        result = posts_collection.insert_one(post_data)
+        return str(result.inserted_id) # Повертаємо ID як рядок
+    except OperationFailure as e:
+        logging.error(f"MongoDB operation failed when adding post: {e}")
+        return None
+    except Exception as e:
+        logging.error(f"Error adding post to MongoDB: {e}")
+        return None
+
+def get_posts_from_db():
+    """Отримує всі оголошення з бази даних MongoDB."""
+    try:
+        posts = list(posts_collection.find().sort("created_at", -1))
+        # Перетворюємо ObjectId на рядок для сумісності
+        for post in posts:
+            if '_id' in post:
+                post['id'] = str(post['_id'])
+        return posts
+    except OperationFailure as e:
+        logging.error(f"MongoDB operation failed when getting posts: {e}")
+        return []
+    except Exception as e:
+        logging.error(f"Error getting posts from MongoDB: {e}")
+        return []
+
+def get_post_by_id_from_db(post_id):
+    """Отримує оголошення за ID."""
+    from bson.objectid import ObjectId # Імпортуємо тут, щоб уникнути кругових залежностей
+    try:
+        post = posts_collection.find_one({"_id": ObjectId(post_id)})
+        if post:
+            post['id'] = str(post['_id']) # Перетворюємо ObjectId на рядок
+        return post
+    except OperationFailure as e:
+        logging.error(f"MongoDB operation failed when getting post by ID: {e}")
+        return None
+    except Exception as e:
+        logging.error(f"Error getting post by ID from MongoDB: {e}")
+        return None
+
+def update_post_description_in_db(post_id, new_description):
+    """Оновлює опис оголошення за ID."""
+    from bson.objectid import ObjectId
+    try:
+        result = posts_collection.update_one(
+            {"_id": ObjectId(post_id)},
+            {"$set": {"description": new_description}}
+        )
+        return result.modified_count > 0
+    except OperationFailure as e:
+        logging.error(f"MongoDB operation failed when updating post description: {e}")
+        return False
+    except Exception as e:
+        logging.error(f"Error updating post description in MongoDB: {e}")
+        return False
+
+def delete_post_from_db(post_id, user_id):
+    """Видаляє оголошення за ID, перевіряючи user_id."""
+    from bson.objectid import ObjectId
+    try:
+        result = posts_collection.delete_one(
+            {"_id": ObjectId(post_id), "user_id": user_id}
+        )
+        return result.deleted_count > 0
+    except OperationFailure as e:
+        logging.error(f"MongoDB operation failed when deleting post: {e}")
+        return False
+    except Exception as e:
+        logging.error(f"Error deleting post from MongoDB: {e}")
+        return False
 
 def can_edit(post):
     created = datetime.fromisoformat(post['created_at'])
@@ -447,8 +516,7 @@ async def add_confirm(call: CallbackQuery, state: FSMContext):
     logging.info(f"User {call.from_user.id} confirmed post creation.")
     await call.answer()
     d = await state.get_data()
-    posts = load_posts()
-    pid = gen_id(posts)
+    
     usr = call.from_user.username or str(call.from_user.id)
 
     # Валідація номеру телефону перед збереженням (повторна перевірка на всяк випадок)
@@ -465,17 +533,25 @@ async def add_confirm(call: CallbackQuery, state: FSMContext):
             await state.set_state(AppStates.MAIN_MENU)
             return
 
-    posts.append({
-        'id': pid, 'user_id': call.from_user.id, 'username': usr,
-        'type': d['type'], 'category': d['category'], 'description': d['desc'],
-        'contacts': contact_info, 'created_at': datetime.utcnow().isoformat()
-    })
-    save_posts(posts)
-    log_event(f"Added {pid}")
+    post_data = {
+        'user_id': call.from_user.id, 
+        'username': usr,
+        'type': d['type'], 
+        'category': d['category'], 
+        'description': d['desc'],
+        'contacts': contact_info, 
+        'created_at': datetime.utcnow().isoformat()
+    }
     
-    await update_or_send_interface_message(call.message.chat.id, state, "✅ Оголошення успішно додано\\!", parse_mode='MarkdownV2') 
-    await show_my_posts_page(call.message.chat.id, state, 0) # Повертаємось на першу сторінку моїх оголошень
-    await state.set_state(AppStates.MY_POSTS_VIEW)
+    pid = add_post_to_db(post_data) # Зберігаємо в БД
+    if pid:
+        log_event(f"Added {pid}")
+        await update_or_send_interface_message(call.message.chat.id, state, "✅ Оголошення успішно додано\\!", parse_mode='MarkdownV2') 
+        await show_my_posts_page(call.message.chat.id, state, 0) # Повертаємось на першу сторінку моїх оголошень
+        await state.set_state(AppStates.MY_POSTS_VIEW)
+    else:
+        await update_or_send_interface_message(call.message.chat.id, state, "❌ Помилка при додаванні оголошення\\. Спробуйте ще раз\\.", main_kb(), parse_mode='MarkdownV2')
+        await state.set_state(AppStates.MAIN_MENU)
 
 
 # ======== Перегляд оголошень (Повернення до пагінації) ========
@@ -508,9 +584,10 @@ async def show_view_posts_page(chat_id: int, state: FSMContext, offset: int = 0)
             logging.error(f"Category not found in state for user {chat_id}")
             return await go_to_main_menu(chat_id, state)
 
-        all_posts_in_category = [p for p in load_posts() if p['category'] == cat]
-        # Сортуємо за датою створення, найновіші перші
-        user_posts = sorted(all_posts_in_category, key=lambda x: datetime.fromisoformat(x['created_at']), reverse=True)
+        all_posts = get_posts_from_db() # Отримуємо пости з БД
+        all_posts_in_category = [p for p in all_posts if p['category'] == cat]
+        # Сортуємо за датою створення, найновіші перші (MongoDB вже повертає відсортовані)
+        user_posts = all_posts_in_category
 
         if not user_posts:
             logging.info(f"No posts found for category '{cat}' for user {chat_id}")
@@ -544,7 +621,7 @@ async def show_view_posts_page(chat_id: int, state: FSMContext, offset: int = 0)
                          f"🔹 {escape_markdown_v2(p['description'])}\n") 
             
             if p['username']:
-                if p['username'].isdigit():
+                if str(p['username']).isdigit(): # Перевіряємо, чи username є просто ID користувача
                     post_block += f"👤 Автор: \\_Приватний користувач\\_\n"
                 else:
                     post_block += f"👤 Автор: \\@{escape_markdown_v2(p['username'])}\n"
@@ -598,7 +675,8 @@ async def my_posts_start(call: CallbackQuery, state: FSMContext):
 async def show_my_posts_page(chat_id: int, state: FSMContext, offset: int = 0):
     logging.info(f"Showing my posts page for user {chat_id}, offset {offset}")
     try:
-        user_posts = sorted([p for p in load_posts() if p['user_id'] == chat_id], key=lambda x: datetime.fromisoformat(x['created_at']), reverse=True)
+        all_posts = get_posts_from_db() # Отримуємо пости з БД
+        user_posts = sorted([p for p in all_posts if p['user_id'] == chat_id], key=lambda x: datetime.fromisoformat(x['created_at']), reverse=True)
         
         await state.update_data(offset=offset) # Зберігаємо offset для подальшого використання
 
@@ -629,7 +707,7 @@ async def show_my_posts_page(chat_id: int, state: FSMContext, offset: int = 0):
                          f"🔹 {escape_markdown_v2(p['description'])}\n")
             
             if p['username']:
-                if p['username'].isdigit():
+                if str(p['username']).isdigit(): # Перевіряємо, чи username є просто ID користувача
                     post_block += f"👤 Автор: \\_Приватний користувач\\_\n"
                 else:
                     post_block += f"👤 Автор: \\@{escape_markdown_v2(p['username'])}\n"
@@ -681,8 +759,8 @@ async def my_posts_paginate(call: CallbackQuery, state: FSMContext):
 async def edit_start(call: CallbackQuery, state: FSMContext):
     logging.info(f"User {call.from_user.id} initiated edit for post {call.data.split('_')[1]}.")
     await call.answer()
-    pid = int(call.data.split('_')[1])
-    post = next((p for p in load_posts() if p['id'] == pid), None)
+    pid = call.data.split('_')[1] # ID тепер рядок
+    post = get_post_by_id_from_db(pid) # Отримуємо пост з БД
     
     if not post or not can_edit(post):
         logging.warning(f"User {call.from_user.id} tried to edit expired or non-existent post {pid}.")
@@ -710,55 +788,50 @@ async def process_edit(msg: types.Message, state: FSMContext):
     data = await state.get_data()
     pid = data['edit_pid']
     
-    posts = load_posts()
-    for p in posts:
-        if p['id'] == pid:
-            p['description'] = text
-            break
-    save_posts(posts)
-    log_event(f"Edited {pid}")
-    
-    await update_or_send_interface_message(msg.chat.id, state, "✅ Опис оголошення оновлено\\!", parse_mode='MarkdownV2')
-    # Повертаємось до списку "Мої оголошення"
-    await show_my_posts_page(msg.chat.id, state, data.get('offset', 0))
-    await state.set_state(AppStates.MY_POSTS_VIEW)
+    updated = update_post_description_in_db(pid, text) # Оновлюємо опис в БД
+    if updated:
+        log_event(f"Edited {pid}")
+        await update_or_send_interface_message(msg.chat.id, state, "✅ Опис оголошення оновлено\\!", parse_mode='MarkdownV2')
+        # Повертаємось до списку "Мої оголошення"
+        await show_my_posts_page(msg.chat.id, state, data.get('offset', 0))
+        await state.set_state(AppStates.MY_POSTS_VIEW)
+    else:
+        await update_or_send_interface_message(msg.chat.id, state, "❌ Помилка при оновленні оголошення\\. Спробуйте ще раз\\.", main_kb(), parse_mode='MarkdownV2')
+        await state.set_state(AppStates.MAIN_MENU)
 
 
 # ======== Видалення ========
 @dp.callback_query_handler(lambda c: c.data.startswith('delete_'), state=AppStates.MY_POSTS_VIEW)
-async def delete_post(call: CallbackQuery, state: FSMContext):
+async def delete_post_handler(call: CallbackQuery, state: FSMContext): # Перейменовано, щоб уникнути конфлікту
     logging.info(f"User {call.from_user.id} initiating delete for post {call.data.split('_')[1]}.")
-    # Виправлено: прибрано parse_mode з call.answer()
-    await call.answer("✅ Оголошення видалено.", show_alert=True) 
-
-    pid = int(call.data.split('_')[1])
     
-    posts = load_posts()
-    # Знаходимо оголошення, яке потрібно видалити, перевіряючи user_id
-    post_to_delete = next((p for p in posts if p['id'] == pid and p['user_id'] == call.from_user.id), None)
+    pid = call.data.split('_')[1] # ID тепер рядок
+    user_id = call.from_user.id
     
-    if not post_to_delete:
+    deleted = delete_post_from_db(pid, user_id) # Видаляємо з БД, перевіряючи user_id
+    
+    if not deleted:
         logging.warning(f"User {call.from_user.id} tried to delete non-existent or unauthorized post {pid}.")
+        await call.answer("🚫 Не вдалося видалити оголошення або воно вже було видалене.", show_alert=True) 
         # Якщо оголошення не знайдене або не належить користувачу, просто оновлюємо список
         await show_my_posts_page(call.message.chat.id, state, (await state.get_data()).get('offset', 0))
         return
 
-    posts.remove(post_to_delete)
-    save_posts(posts)
     log_event(f"Deleted {pid}")
+    await call.answer("✅ Оголошення видалено.", show_alert=True) 
 
     data = await state.get_data()
     current_offset = data.get('offset', 0)
     
     # Після видалення, отримуємо оновлений список оголошень користувача
-    user_posts_after_delete = [p for p in load_posts() if p['user_id'] == call.from_user.id]
+    all_user_posts_after_delete = [p for p in get_posts_from_db() if p['user_id'] == user_id]
     
     # Визначаємо новий offset
     new_offset = current_offset
     
     # Якщо поточний offset тепер більший або дорівнює загальній кількості оголошень
     # і при цьому offset не нульовий, переміщаємось на попередню сторінку
-    if new_offset >= len(user_posts_after_delete) and new_offset > 0:
+    if new_offset >= len(all_user_posts_after_delete) and new_offset > 0:
         new_offset = max(0, new_offset - MY_POSTS_PER_PAGE)
     
     # Завжди оновлюємо сторінку після видалення
@@ -795,12 +868,12 @@ async def err_handler(update, exception):
         if isinstance(exception, (BadRequest, TelegramAPIError)):
             if "Can't parse entities" in str(exception):
                 logging.error("Markdown parse error detected. Ensure all user-supplied text is escaped.")
-                await update_or_send_interface_message(chat_id, dp.current_state(), "Вибачте, сталася помилка з відображенням тексту\\. Можливо, в описі є некоректні символи\\.", main_kb(), parse_mode='MarkdownV2')
+                await update_or_send_interface_message(chat_id, dp.current_state(), "Вибачте, сталася помилка з відображенням тексту\\\\. Можливо, в описі є некоректні символи\\\\.", main_kb(), parse_mode='MarkdownV2')
                 await dp.current_state().set_state(AppStates.MAIN_MENU)
                 return True
             elif "Text must be non-empty" in str(exception):
                 logging.error("Message text is empty error detected.")
-                await update_or_send_interface_message(chat_id, dp.current_state(), "Вибачте, сталася внутрішня помилка\\. Спробуйте ще раз\\.", main_kb())
+                await update_or_send_interface_message(chat_id, dp.current_state(), "Вибачте, сталася внутрішня помилка\\\\. Спробуйте ще раз\\\\.", main_kb())
                 await dp.current_state().set_state(AppStates.MAIN_MENU)
                 return True
             elif "message is not modified" in str(exception): 
