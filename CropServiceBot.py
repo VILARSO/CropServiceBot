@@ -26,14 +26,14 @@ if not API_TOKEN:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logging.getLogger().addHandler(logging.StreamHandler())
 
-bot = Bot(token=API_TOKEN)
-dp = Dispatcher(bot, storage=MongoStorage(uri=MONGO_URI, db_name='cropservice_db'))
-
 # ======== Налаштування MongoDB ========
 MONGO_URI = os.getenv('MONGO_DB_URL') # Використовуємо MONGO_DB_URL, як ви її налаштували
 if not MONGO_URI:
     print("❌ MONGO_DB_URL не заданий. Будь ласка, встановіть змінну середовища MONGO_DB_URL для підключення до MongoDB.")
     exit(1)
+
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(bot, storage=MongoStorage(uri=MONGO_URI, db_name='cropservice_db'))
 
 db = None # Глобальна змінна для клієнта MongoDB
 
