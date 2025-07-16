@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.contrib.fsm_storage.mongo import MongoStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
@@ -26,7 +27,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logging.getLogger().addHandler(logging.StreamHandler())
 
 bot = Bot(token=API_TOKEN)
-dp = Dispatcher(bot, storage=MemoryStorage())
+dp = Dispatcher(bot, storage=MongoStorage(uri=MONGO_URI, db_name='cropservice_db'))
 
 # ======== Налаштування MongoDB ========
 MONGO_URI = os.getenv('MONGO_DB_URL') # Використовуємо MONGO_DB_URL, як ви її налаштували
